@@ -147,3 +147,7 @@ func (e Call) String() string {
 
 	return res + ")"
 }
+
+func Len(e Expr) Expr {
+	return Call{Atom{"len"}, []Expr{e}}
+}

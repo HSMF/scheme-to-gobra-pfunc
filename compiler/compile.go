@@ -7,22 +7,40 @@ import (
 	"github.com/HSMF/scheme-to-gobra-pfunc/parser"
 )
 
+var compileExprHandlers map[string]compileExprHandler
+
 func init() {
 	compileExprHandlers = map[string]compileExprHandler{
-		"+":   compileBinop("+"),
-		"-":   compileBinop("-"),
-		"*":   compileBinop("*"),
-		"/":   compileBinop("/"),
-		"=":   compileBinop("=="),
-		"++":  compileBinop("++"),
-		">=":  compileBinop(">="),
-		">":   compileBinop(">"),
-		"<":   compileBinop("<"),
-		"<=":  compileBinop("<="),
-		"if":  compileTernary,
-		"seq": compileSeq,
-		"slice": func(n parser.Node) ([]PureFunc, Expr) {
-			panic("todo")
+		"+":    compileBinop("+"),
+		"-":    compileBinop("-"),
+		"*":    compileBinop("*"),
+		"/":    compileBinop("/"),
+		"=":    compileBinop("=="),
+		"=seq": compileBinop("=="),
+		"++":   compileBinop("++"),
+		">=":   compileBinop(">="),
+		">":    compileBinop(">"),
+		"<":    compileBinop("<"),
+		"<=":   compileBinop("<="),
+		"&&":   compileBinop("&&"),
+		"||":   compileBinop("||"),
+		"if":   compileTernary,
+		"seq":  compileSeq,
+		"null?": func(n parser.Node, ctx *ctx) ([]PureFunc, Expr) {
+
+			pfuncs, compiled := compileExpr(n.Children[1], ctx)
+
+			return pfuncs, BinOp{Len(compiled), Atom{"0"}, "=="}
+		},
+		"slice": func(n parser.Node, ctx *ctx) ([]PureFunc, Expr) {
+			pfuncs, compiledSeq := compileExpr(n.Children[1], ctx)
+			compiledLow := compileAppendPureFuncs(compileExpr, n.Children[2], ctx, &pfuncs)
+			compiledHigh := compileAppendPureFuncs(compileExpr, n.Children[3], ctx, &pfuncs)
+			return pfuncs, SeqSlice{compiledSeq, &compiledLow, &compiledHigh}
+		},
+		"letrec": compileInnerFunction,
+		"cond": func(n parser.Node, ctx *ctx) ([]PureFunc, Expr) {
+			panic("todo: conditionals")
 		},
 	}
 }
@@ -39,6 +57,11 @@ func Compile(items []parser.AstNode) []PureFunc {
 }
 
 type handlerFunc = func(item parser.Node) []PureFunc
+type compileExprHandler func(parser.Node, *ctx) ([]PureFunc, Expr)
+
+type ctx struct {
+	args map[string]string
+}
 
 func getChildrenByLabel(it parser.Node, label string) []parser.AstNode {
 	res := make([]parser.AstNode, 0)
@@ -66,41 +89,39 @@ func stripString(s string) string {
 	return strings.TrimSuffix(strings.TrimPrefix(s, "\""), "\"")
 }
 
-func compileAppendPureFuncs[A any, B any](compile func(A) ([]PureFunc, B), n A, pf *[]PureFunc) B {
-	more, compiled := compile(n)
+func compileAppendPureFuncs[A any, B any](compile func(A, *ctx) ([]PureFunc, B), n A, ctx *ctx, pf *[]PureFunc) B {
+	more, compiled := compile(n, ctx)
 	*pf = append(*pf, more...)
 	return compiled
 }
 
-type compileExprHandler func(parser.Node) ([]PureFunc, Expr)
-
 func compileBinop(op string) compileExprHandler {
-	return func(n parser.Node) ([]PureFunc, Expr) {
+	return func(n parser.Node, ctx *ctx) ([]PureFunc, Expr) {
 		arg1 := n.Children[1]
 		arg2 := n.Children[2]
 
-		funcs, compiledArg1 := compileExpr(arg1)
-		more, compiledArg2 := compileExpr(arg2)
+		funcs, compiledArg1 := compileExpr(arg1, ctx)
+		more, compiledArg2 := compileExpr(arg2, ctx)
 
 		return append(funcs, more...),
 			BinOp{compiledArg1, compiledArg2, op}
 	}
 }
 
-func compileTernary(n parser.Node) ([]PureFunc, Expr) {
+func compileTernary(n parser.Node, ctx *ctx) ([]PureFunc, Expr) {
 	cond := n.Children[1]
 	then := n.Children[2]
 	otherwise := n.Children[3]
 
 	funcs := make([]PureFunc, 0)
 
-	compiledCond := compileAppendPureFuncs(compileExpr, cond, &funcs)
-	compiledThen := compileAppendPureFuncs(compileExpr, then, &funcs)
-	compiledOtherwise := compileAppendPureFuncs(compileExpr, otherwise, &funcs)
+	compiledCond := compileAppendPureFuncs(compileExpr, cond, ctx, &funcs)
+	compiledThen := compileAppendPureFuncs(compileExpr, then, ctx, &funcs)
+	compiledOtherwise := compileAppendPureFuncs(compileExpr, otherwise, ctx, &funcs)
 	return funcs, TernaryCond{compiledCond, compiledThen, compiledOtherwise}
 }
 
-func compileSeq(n parser.Node) ([]PureFunc, Expr) {
+func compileSeq(n parser.Node, ctx *ctx) ([]PureFunc, Expr) {
 	typ := stripString(n.Children[1].String())
 	elems := n.Children[2:]
 
@@ -109,16 +130,22 @@ func compileSeq(n parser.Node) ([]PureFunc, Expr) {
 	compiledElems := make([]Expr, len(elems))
 	for i, arg := range elems {
 		var more []PureFunc
-		more, compiledElems[i] = compileExpr(arg)
+		more, compiledElems[i] = compileExpr(arg, ctx)
 		pfuncs = append(pfuncs, more...)
 	}
 
 	return pfuncs, SeqLiteral{typ, compiledElems}
 }
 
-var compileExprHandlers map[string]compileExprHandler
+func compileInnerFunction(item parser.Node, ctx *ctx) ([]PureFunc, Expr) {
 
-func compileExpr(item parser.AstNode) ([]PureFunc, Expr) {
+	// letrec is only supported like this:
+	// (letrec ((name (lambda (...args) (begin ...) ) )) expr )
+
+	panic("todo: inner functions")
+}
+
+func compileExpr(item parser.AstNode, ctx *ctx) ([]PureFunc, Expr) {
 
 	switch it := item.(type) {
 	case parser.Atom:
@@ -128,18 +155,18 @@ func compileExpr(item parser.AstNode) ([]PureFunc, Expr) {
 		specialHandler, isSpecial := compileExprHandlers[item.Label()]
 
 		if isSpecial {
-			return specialHandler(it)
+			return specialHandler(it, ctx)
 		}
 
 		fn := it.Children[0]
 		args := it.Children[1:]
 
-		pfuncs, compiledFn := compileExpr(fn)
+		pfuncs, compiledFn := compileExpr(fn, ctx)
 
 		compiledArgs := make([]Expr, len(args))
 		for i, arg := range args {
 			var more []PureFunc
-			more, compiledArgs[i] = compileExpr(arg)
+			more, compiledArgs[i] = compileExpr(arg, ctx)
 			pfuncs = append(pfuncs, more...)
 		}
 
@@ -149,14 +176,14 @@ func compileExpr(item parser.AstNode) ([]PureFunc, Expr) {
 	panic("unreachable")
 }
 
-func compileSpec(conditions []parser.AstNode) ([]PureFunc, []Expr) {
+func compileSpec(conditions []parser.AstNode, ctx *ctx) ([]PureFunc, []Expr) {
 	fmt.Printf("conditions: %v\n", conditions)
 	res := make([]Expr, 0)
 	pfuncs := make([]PureFunc, 0)
 
 	for _, cond := range conditions {
 		condVal := cond.(parser.Node).Children[1]
-		pf, compiled := compileExpr(condVal)
+		pf, compiled := compileExpr(condVal, ctx)
 		pfuncs = append(pfuncs, pf...)
 		res = append(res, compiled)
 	}
@@ -176,9 +203,13 @@ func compileDefine(item parser.Node) []PureFunc {
 	retTyp := getChildrenByLabel(body, "returns")[0].(parser.Node).Children[1].String()
 
 	compiledArgs := make([]Arg, len(args.Children)-1)
+	argTypes := make(map[string]string)
 	for i, arg := range args.Children[1:] {
 		a := arg.(parser.Node)
-		compiledArgs[i] = Arg{name: a.Children[0].String(), typ: stripString(a.Children[1].String())}
+		name := a.Children[0].String()
+		typ := stripString(a.Children[1].String())
+		compiledArgs[i] = Arg{name: name, typ: typ}
+		argTypes[name] = typ
 	}
 
 	exprs := getChildrenByFunc(body, func(label string) bool {
@@ -186,11 +217,13 @@ func compileDefine(item parser.Node) []PureFunc {
 	})
 	expr := exprs[len(exprs)-1]
 
-	pfuncs, compiledExpr := compileExpr(expr)
+	ctx := &ctx{}
 
-	compiledPre := compileAppendPureFuncs(compileSpec, preconditions, &pfuncs)
-	compiledPres := compileAppendPureFuncs(compileSpec, preservesconditions, &pfuncs)
-	compiledPost := compileAppendPureFuncs(compileSpec, postconditions, &pfuncs)
+	pfuncs, compiledExpr := compileExpr(expr, ctx)
+
+	compiledPre := compileAppendPureFuncs(compileSpec, preconditions, ctx, &pfuncs)
+	compiledPres := compileAppendPureFuncs(compileSpec, preservesconditions, ctx, &pfuncs)
+	compiledPost := compileAppendPureFuncs(compileSpec, postconditions, ctx, &pfuncs)
 
 	return append(pfuncs, PureFunc{
 		name:   name,
